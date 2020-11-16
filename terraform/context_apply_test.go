@@ -11390,17 +11390,28 @@ variable "ct" {
 
 resource "test_instance" "a" {
   count = var.ct
+}
+
+resource "test_instance" "b" {
+  require_new = local.removable
   lifecycle {
 	create_before_destroy = true
   }
 }
 
-resource "test_instance" "b" {
-  foo = join(".", test_instance.a[*].id)
+resource "test_instance" "c" {
+  require_new = test_instance.b.id
+  lifecycle {
+	create_before_destroy = true
+  }
 }
 
 output "out" {
   value = join(".", test_instance.a[*].id)
+}
+
+locals {
+  removable = join(".", test_instance.a[*].id)
 }
 `})
 
@@ -11409,27 +11420,43 @@ output "out" {
 	root.SetResourceInstanceCurrent(
 		mustResourceInstanceAddr("test_instance.a[0]").Resource,
 		&states.ResourceInstanceObjectSrc{
-			Status:       states.ObjectReady,
-			AttrsJSON:    []byte(`{"id":"a0"}`),
-			Dependencies: []addrs.ConfigResource{mustResourceAddr("module.child.aws_instance.child")},
+			Status:              states.ObjectReady,
+			AttrsJSON:           []byte(`{"id":"a0"}`),
+			Dependencies:        []addrs.ConfigResource{},
+			CreateBeforeDestroy: true,
 		},
 		mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
 	)
 	root.SetResourceInstanceCurrent(
 		mustResourceInstanceAddr("test_instance.a[1]").Resource,
 		&states.ResourceInstanceObjectSrc{
-			Status:       states.ObjectReady,
-			AttrsJSON:    []byte(`{"id":"a1"}`),
-			Dependencies: []addrs.ConfigResource{mustResourceAddr("module.child.aws_instance.child")},
+			Status:              states.ObjectReady,
+			AttrsJSON:           []byte(`{"id":"a1"}`),
+			Dependencies:        []addrs.ConfigResource{},
+			CreateBeforeDestroy: true,
 		},
 		mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
 	)
 	root.SetResourceInstanceCurrent(
 		mustResourceInstanceAddr("test_instance.b").Resource,
 		&states.ResourceInstanceObjectSrc{
-			Status:       states.ObjectReady,
-			AttrsJSON:    []byte(`{"id":"b", "foo":"old.old"}`),
-			Dependencies: []addrs.ConfigResource{mustResourceAddr("test_instance.a")},
+			Status:              states.ObjectReady,
+			AttrsJSON:           []byte(`{"id":"b", "require_new":"old.old"}`),
+			Dependencies:        []addrs.ConfigResource{mustResourceAddr("test_instance.a")},
+			CreateBeforeDestroy: true,
+		},
+		mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
+	)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_instance.c").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"id":"c", "require_new":"b"}`),
+			Dependencies: []addrs.ConfigResource{
+				mustResourceAddr("test_instance.a"),
+				mustResourceAddr("test_instance.b"),
+			},
+			CreateBeforeDestroy: true,
 		},
 		mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
 	)
@@ -11443,7 +11470,7 @@ output "out" {
 	ctx := testContext2(t, &ContextOpts{
 		Variables: InputValues{
 			"ct": &InputValue{
-				Value:      cty.NumberIntVal(1),
+				Value:      cty.NumberIntVal(0),
 				SourceType: ValueFromCaller,
 			},
 		},
@@ -11462,6 +11489,11 @@ output "out" {
 	// if resource b isn't going to apply correctly, we will get an error about
 	// an invalid plan value
 	state, diags = ctx.Apply()
+	errMsg := diags.ErrWithWarnings().Error()
+	if strings.Contains(errMsg, "Cycle") {
+		t.Fatal("test should not produce a cycle:\n", errMsg)
+	}
+
 	if !diags.HasErrors() {
 		// FIXME: this test is correct, but needs to wait until we no longer
 		// evaluate resourced that are pending destruction.
@@ -11765,4 +11797,213 @@ output "outputs" {
 	destroy()
 	// Destroying again from the empty state should not cause any errors either
 	destroy()
+}
+
+func TestContext2Apply_createBeforeDestroyWithModule(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+variable "v" {}
+
+module "mod" {
+    source = "./mod"
+    in = var.v
+}
+
+resource "test_resource" "a" {
+  value = var.v
+  depends_on = [module.mod]
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+`,
+		"mod/main.tf": `
+variable "in" {}
+
+resource "test_resource" "a" {
+  value = var.in
+}
+`})
+
+	p := testProvider("test")
+	p.ApplyFn = testApplyFn
+	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
+		proposed := req.ProposedNewState.AsValueMap()
+		proposed["id"] = cty.UnknownVal(cty.String)
+		return providers.PlanResourceChangeResponse{
+			PlannedState:    cty.ObjectVal(proposed),
+			RequiresReplace: []cty.Path{cty.Path{cty.GetAttrStep{Name: "value"}}},
+		}
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Config: m,
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+		Variables: InputValues{
+			"v": &InputValue{
+				Value: cty.StringVal("A"),
+			},
+		},
+	})
+
+	if _, diags := ctx.Plan(); diags.HasErrors() {
+		t.Fatalf("plan errors: %s", diags.Err())
+	}
+
+	state, diags := ctx.Apply()
+	if diags.HasErrors() {
+		t.Fatalf("apply errors: %s", diags.Err())
+	}
+
+	ctx = testContext2(t, &ContextOpts{
+		Config: m,
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+		Variables: InputValues{
+			"v": &InputValue{
+				Value: cty.StringVal("B"),
+			},
+		},
+		State: state,
+	})
+
+	if _, diags := ctx.Plan(); diags.HasErrors() {
+		t.Fatalf("plan errors: %s", diags.Err())
+	}
+
+	_, diags = ctx.Apply()
+	if diags.HasErrors() {
+		t.Fatalf("apply errors: %s", diags.Err())
+	}
+}
+
+func TestContext2Apply_forcedCBD(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+variable "v" {}
+
+resource "test_instance" "a" {
+  require_new = var.v
+}
+
+resource "test_instance" "b" {
+  depends_on = [test_instance.a]
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+`})
+
+	p := testProvider("test")
+	p.ApplyFn = testApplyFn
+	p.DiffFn = testDiffFn
+
+	ctx := testContext2(t, &ContextOpts{
+		Config: m,
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+		Variables: InputValues{
+			"v": &InputValue{
+				Value: cty.StringVal("A"),
+			},
+		},
+	})
+
+	if _, diags := ctx.Plan(); diags.HasErrors() {
+		t.Fatalf("plan errors: %s", diags.Err())
+	}
+
+	state, diags := ctx.Apply()
+	if diags.HasErrors() {
+		t.Fatalf("apply errors: %s", diags.Err())
+	}
+
+	ctx = testContext2(t, &ContextOpts{
+		Config: m,
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+		Variables: InputValues{
+			"v": &InputValue{
+				Value: cty.StringVal("B"),
+			},
+		},
+		State: state,
+	})
+
+	if _, diags := ctx.Plan(); diags.HasErrors() {
+		t.Fatalf("plan errors: %s", diags.Err())
+	}
+
+	_, diags = ctx.Apply()
+	if diags.HasErrors() {
+		t.Fatalf("apply errors: %s", diags.Err())
+	}
+}
+
+func TestContext2Apply_removeReferencedResource(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+variable "ct" {
+}
+
+resource "test_resource" "to_remove" {
+  count = var.ct
+}
+
+resource "test_resource" "c" {
+  value = join("", test_resource.to_remove[*].id)
+}
+`})
+
+	p := testProvider("test")
+	p.ApplyFn = testApplyFn
+	p.DiffFn = testDiffFn
+
+	ctx := testContext2(t, &ContextOpts{
+		Config: m,
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+		Variables: InputValues{
+			"ct": &InputValue{
+				Value: cty.NumberIntVal(1),
+			},
+		},
+	})
+
+	if _, diags := ctx.Plan(); diags.HasErrors() {
+		t.Fatalf("plan errors: %s", diags.Err())
+	}
+
+	state, diags := ctx.Apply()
+	if diags.HasErrors() {
+		t.Fatalf("apply errors: %s", diags.Err())
+	}
+
+	ctx = testContext2(t, &ContextOpts{
+		Config: m,
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+		Variables: InputValues{
+			"ct": &InputValue{
+				Value: cty.NumberIntVal(0),
+			},
+		},
+		State: state,
+	})
+
+	if _, diags := ctx.Plan(); diags.HasErrors() {
+		t.Fatalf("plan errors: %s", diags.Err())
+	}
+
+	_, diags = ctx.Apply()
+	if diags.HasErrors() {
+		t.Fatalf("apply errors: %s", diags.Err())
+	}
 }
